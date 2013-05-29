@@ -6,7 +6,13 @@ import Control.Parallel (par, pseq)
 import Control.Parallel.Strategies
 
 -- data types for duplicates and commit pairs
+type GitDuplicate = (String,String,String)
+type GitCommitEntry = (String,String)
+type GitCommitID = String
+type GitCommitMsg = String
+type GitPatch = String
 
+-- Print command line usage
 showUsage :: IO [String]
 showUsage = do
           progname <- getProgName
@@ -28,50 +34,55 @@ showUsage = do
 main :: IO()
 main = do
      (date:forkBranch:baseBranch:_) <- (getArgs >>= \x -> if (length x == 3) then return x else showUsage)
-     (statusFork, outFork, _) <- readProcessWithExitCode "git"
-                  ["log", "--pretty=oneline", "--since", date, forkBranch]
-                  ""
      (statusBase, outBase, _) <- readProcessWithExitCode "git"
                   ["log", "--pretty=oneline", "--since", date, baseBranch]
                   ""
+     (statusFork, outFork, _) <- readProcessWithExitCode "git"
+                  ["log", "--pretty=oneline", "--since", date, forkBranch]
+                  ""
+     -- Get (commit ID, log msg) tuples for each branch
      let baseTuples = map commitAndMessageTuple $ lines outBase
      let forkTuples = map commitAndMessageTuple $ lines outFork
-     let missingCommits = parFilter commitsNotMatching baseTuples forkTuples
-     let missingMessages = parFilter messagesNotMatching missingCommits forkTuples
-     let maybeMissing = filter (\x -> not $ x `elem` missingMessages) missingCommits
-     let duplicates = [(cfork, cbase, fmsg) | (cfork,fmsg) <- forkTuples, (cbase, bmsg) <- missingCommits,
-                       fmsg == bmsg]
-     -- Show entries in base that aren't in fork
+     -- Find tuples with no matching git commit IDs in fork branch
+     let unmatchedCommitTuples = parFilter commitsNotMatching baseTuples forkTuples
+     -- Of those, find tuples with no matching log message in fork branch
+     let missingTuples = parFilter messagesNotMatching unmatchedCommitTuples forkTuples
+     -- Find tuples with mismatched commit ID, but matching log msg
+     let logMsgDuplicates = [(cbase, cfork, fmsg)
+                          | (cfork,fmsg) <- forkTuples, (cbase, bmsg) <- unmatchedCommitTuples,
+                          fmsg == bmsg]
+     -- Of those, find tuples with mismatched diff patches
+     unmatchedDiffTuples <- filterM (\x -> duplicateValid x >>= \valid -> return (not valid)) logMsgDuplicates
+
      putStrLn $ "Testing " ++ (show $ (length baseTuples)*(length forkTuples)) ++ " options."
      putStrLn ""
      putStrLn $ "*** Definitely missing: ***"
-     prettyPrintList missingMessages
+     prettyPrintList missingTuples
      putStrLn ""
      putStrLn $ "*** Commit IDs changed: ***"
-     mapM_ (\(c1,c2,m) -> putStrLn $ (take 10 c1) ++ ", " ++ (take 10 c2) ++ ", " ++ m) duplicates
+     prettyPrintDuplicates logMsgDuplicates
      putStrLn ""
      putStrLn $ "*** Probably missing (patches differ): ***"
-     prettyPrintDuplicates duplicates
+     prettyPrintDuplicates unmatchedDiffTuples
      putStrLn ""
 
-prettyPrintDuplicates :: [(String,String,String)] -> IO ()
-prettyPrintDuplicates dupes = do
-                      nonmatching <- filterM (\x -> duplicateValid x >>= \valid -> return (not valid)) dupes
-                      mapM_ (\dupl@(c1,c2,m) -> (duplicateValid dupl)
-                            >>= \r -> putStrLn $ (take 10 c1) ++ ", " ++ (take 10 c2) ++ m) nonmatching
 
-duplicateValid :: (String,String,String) -> IO Bool
+-- Return true of patchsets from both commits in a duplicate tuple match
+duplicateValid :: GitDuplicate -> IO Bool
 duplicateValid dupl = do
                (p1,p2) <- patchesFromDuplicate dupl
                return (patchesMatch p1 p2)
 
-patchesMatch :: String -> String -> Bool
+-- Return true if both given patchsets, when cleaned up, match
+patchesMatch :: GitPatch -> GitPatch -> Bool
 patchesMatch p1 p2 = (scrubbedPatch p1) == (scrubbedPatch p2)
 
-scrubbedPatch :: String -> String
+-- Remove index line and line range sections from given patch
+scrubbedPatch :: GitPatch -> GitPatch
 scrubbedPatch patch = patchWithoutIndex . patchWithoutRange $ patch
 
-patchWithoutIndex :: String -> String
+-- Strip 'index' line from patch
+patchWithoutIndex :: GitPatch -> GitPatch
 patchWithoutIndex patch = unlines (patchWithoutIndexRecurse (lines patch) [] False)
 patchWithoutIndexRecurse :: [String] -> [String] -> Bool -> [String]
 patchWithoutIndexRecurse [] accum _ = accum
@@ -80,8 +91,8 @@ patchWithoutIndexRecurse (l:ls) accum lastWasDiff
                          | (take 5 l) == "diff " = patchWithoutIndexRecurse ls (accum++[l]) True
                          | otherwise = patchWithoutIndexRecurse ls (accum++[l]) False
 
-
-patchWithoutRange :: String -> String
+-- String line offset 'range' from patch
+patchWithoutRange :: GitPatch -> GitPatch
 patchWithoutRange commit = patchWithoutRangeRecurse commit "" 0 False
 patchWithoutRangeRecurse :: String -> String -> Int -> Bool -> String
 patchWithoutRangeRecurse [] accum _ _ = reverse accum
@@ -93,23 +104,31 @@ patchWithoutRangeRecurse (x:xs) accum atCount inPatch
                          | inPatch = patchWithoutRangeRecurse xs accum atCount True
                          | otherwise = patchWithoutRangeRecurse xs (x:accum) atCount False
 
-
-patchesFromDuplicate :: (String,String,String) -> IO (String, String)
+-- Given a duplicate tuple, return tuple containing full text of each commit's patch
+patchesFromDuplicate :: GitDuplicate -> IO (GitPatch, GitPatch)
 patchesFromDuplicate (c1,c2,msg) = do
                      p1 <- patchForCommit c1
                      p2 <- patchForCommit c2
                      return (p1,p2)
 
-patchForCommit :: String -> IO String
+-- Return the 'git diff' patch for a given commit ID
+patchForCommit :: GitCommitID -> IO GitPatch
 patchForCommit commit = do
                (status, out, _) <- readProcessWithExitCode "git" ["diff", commit ++ "~1.." ++ commit] ""
                return out
 
-prettyPrintList :: [(String,String)] -> IO()
+-- Print a (commit ID, msg) tuple
+prettyPrintList :: [GitCommitEntry] -> IO()
 prettyPrintList xs = mapM_ (\(c,m) -> putStrLn $ (take 10 c) ++ ", " ++ m) xs
 
+-- Print a (commit ID, commit ID, msg) tuple
+prettyPrintDuplicates :: [GitDuplicate] -> IO ()
+prettyPrintDuplicates xs = mapM_ (\(c1,c2,m) ->
+                      putStrLn $ (take 10 c1) ++ ", " ++ (take 10 c2) ++ m) xs
+
 -- run a filter fn in parallel by repeatedly splitting base in half and comparing
--- against all of the fork items.
+-- against all of the fork items. Stop splitting when list is below some size.
+parFilter :: ([GitCommitEntry] -> [GitCommitEntry] -> [GitCommitEntry]) -> [GitCommitEntry] -> [GitCommitEntry] -> [GitCommitEntry]
 parFilter fn base fork
             | length base <= 50 = fn base fork
             | otherwise = commits1 `par` (commits2 `pseq` (commits1 ++ commits2))
@@ -117,24 +136,24 @@ parFilter fn base fork
                   commits1 = parFilter fn base1 fork
                   commits2 = parFilter fn base2 fork
 
--- Split a line into a tuple containing the git commit and git message
-commitAndMessageTuple :: String -> (String, String)
-commitAndMessageTuple line = let (w:ws) = words line in (w, unwords ws)
-
 -- Return whether commit string compares to any of the tuples using tupleFn
-stringInTuples :: String -> [(String,String)] -> ((String,String) -> String) -> Bool
+stringInTuples :: GitCommitID -> [GitCommitEntry] -> (GitCommitEntry -> String) -> Bool
 stringInTuples commit tuples tupleFn = (>0) $ length $ filter (\x -> commit == tupleFn x) tuples
 
 -- git log lines in baseTuples as (commit,msg) tuples, filtered by whether it matches
 -- forkTuples using the helper functions.  tupleFn is fst or snd, and cmpFn is == or /=.
-linesMatchingRules :: [(String,String)] -> [(String,String)] -> ((String,String) -> String) -> (Bool -> Bool -> Bool) -> [(String,String)]
+linesMatchingRules :: [GitCommitEntry] -> [GitCommitEntry] -> (GitCommitEntry -> String) -> (Bool -> Bool -> Bool) -> [GitCommitEntry]
 linesMatchingRules baseTuples forkTuples tupleFn cmpFn =
           filter (\x -> (cmpFn True) $ (stringInTuples (tupleFn x) forkTuples tupleFn)) baseTuples
 
 -- Commits in base that aren't in fork
-commitsNotMatching :: [(String,String)] -> [(String,String)] -> [(String,String)]
+commitsNotMatching :: [GitCommitEntry] -> [GitCommitEntry] -> [GitCommitEntry]
 commitsNotMatching baseTuples forkTuples = linesMatchingRules baseTuples forkTuples fst (/=)
 
 -- Message logs in base that aren't in fork
-messagesNotMatching :: [(String,String)] -> [(String,String)] -> [(String,String)]
+messagesNotMatching :: [GitCommitEntry] -> [GitCommitEntry] -> [GitCommitEntry]
 messagesNotMatching baseTuples forkTuples = linesMatchingRules baseTuples forkTuples snd (/=)
+
+-- Split a line into a tuple containing the git commit and git message
+commitAndMessageTuple :: String -> GitCommitEntry
+commitAndMessageTuple line = let (w:ws) = words line in (w, unwords ws)
